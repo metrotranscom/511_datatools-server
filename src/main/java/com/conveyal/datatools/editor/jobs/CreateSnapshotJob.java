@@ -2,6 +2,7 @@ package com.conveyal.datatools.editor.jobs;
 
 import com.conveyal.datatools.common.status.MonitorableJob;
 import com.conveyal.datatools.manager.DataManager;
+import com.conveyal.datatools.manager.auth.Auth0UserProfile;
 import com.conveyal.datatools.manager.models.FeedSource;
 import com.conveyal.datatools.manager.models.Snapshot;
 import com.conveyal.datatools.manager.persistence.Persistence;
@@ -62,14 +63,14 @@ public class CreateSnapshotJob extends MonitorableJob {
     private Snapshot snapshot;
     private FeedSource feedSource;
 
-    public CreateSnapshotJob(Snapshot snapshot, boolean updateBufferNamespace, boolean storeSnapshot, boolean preserveBufferAsSnapshot) {
-        super(snapshot.userId, "Creating snapshot for " + snapshot.feedSourceId, JobType.CREATE_SNAPSHOT);
+    public CreateSnapshotJob(Auth0UserProfile owner, Snapshot snapshot, boolean updateBufferNamespace, boolean storeSnapshot, boolean preserveBufferAsSnapshot) {
+        super(owner, "Creating snapshot for " + snapshot.feedSourceId, JobType.CREATE_SNAPSHOT);
         this.namespace = snapshot.snapshotOf;
         this.snapshot = snapshot;
         this.updateBuffer = updateBufferNamespace;
         this.storeSnapshot = storeSnapshot;
         this.preserveBuffer = preserveBufferAsSnapshot;
-        status.update(false,  "Initializing...", 0);
+        status.update( "Initializing...", 0);
     }
 
     @JsonProperty
@@ -85,8 +86,8 @@ public class CreateSnapshotJob extends MonitorableJob {
         this.name = String.format("Creating snapshot for %s", feedSource.name);
         Collection<Snapshot> existingSnapshots = feedSource.retrieveSnapshots();
         int version = existingSnapshots.size();
-        status.update(false,  "Creating snapshot...", 20);
-        FeedLoadResult loadResult = makeSnapshot(namespace, DataManager.GTFS_DATA_SOURCE);
+        status.update("Creating snapshot...", 20);
+        FeedLoadResult loadResult = makeSnapshot(namespace, DataManager.GTFS_DATA_SOURCE, !feedSource.preserveStopTimesSequence);
         snapshot.version = version;
         snapshot.namespace = loadResult.uniqueIdentifier;
         snapshot.feedLoadResult = loadResult;
@@ -94,6 +95,7 @@ public class CreateSnapshotJob extends MonitorableJob {
             snapshot.generateName();
         }
         snapshot.snapshotTime = loadResult.completionTime;
+        status.update("Database snapshot finished.", 80);
     }
 
     @Override
@@ -130,7 +132,7 @@ public class CreateSnapshotJob extends MonitorableJob {
                         snapshot.namespace
                 );
             }
-            status.update(false, "Created snapshot!", 100, true);
+            status.completeSuccessfully("Created snapshot!");
         }
     }
 }

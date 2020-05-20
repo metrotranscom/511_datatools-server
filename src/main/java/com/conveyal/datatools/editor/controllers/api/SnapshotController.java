@@ -8,6 +8,7 @@ import com.conveyal.datatools.manager.DataManager;
 import com.conveyal.datatools.manager.auth.Auth0UserProfile;
 import com.conveyal.datatools.manager.auth.Actions;
 import com.conveyal.datatools.manager.controllers.api.FeedVersionController;
+import com.conveyal.datatools.manager.jobs.CreateFeedVersionFromSnapshotJob;
 import com.conveyal.datatools.manager.models.FeedDownloadToken;
 import com.conveyal.datatools.manager.models.FeedSource;
 import com.conveyal.datatools.manager.models.FeedVersion;
@@ -24,7 +25,7 @@ import spark.Response;
 import java.io.IOException;
 import java.util.Collection;
 
-import static com.conveyal.datatools.common.utils.S3Utils.downloadFromS3;
+import static com.conveyal.datatools.common.utils.AWSUtils.downloadFromS3;
 import static com.conveyal.datatools.common.utils.SparkUtils.downloadFile;
 import static com.conveyal.datatools.common.utils.SparkUtils.formatJobMessage;
 import static com.conveyal.datatools.common.utils.SparkUtils.logMessageAndHalt;
@@ -39,7 +40,7 @@ import static spark.Spark.put;
  */
 public class SnapshotController {
 
-    public static final Logger LOG = LoggerFactory.getLogger(SnapshotController.class);
+    private static final Logger LOG = LoggerFactory.getLogger(SnapshotController.class);
     public static JsonManager<Snapshot> json =
             new JsonManager<>(Snapshot.class, JsonViews.UserInterface.class);
 
@@ -80,6 +81,9 @@ public class SnapshotController {
      */
     private static String createSnapshot (Request req, Response res) throws IOException {
         Auth0UserProfile userProfile = req.attribute("user");
+        boolean publishNewVersion = Boolean.parseBoolean(
+            req.queryParamOrDefault("publishNewVersion", Boolean.FALSE.toString())
+        );
         FeedSource feedSource = FeedVersionController.requestFeedSourceById(req, Actions.EDIT, "feedId");
         // Take fields from request body for creating snapshot.
         Snapshot snapshot = json.read(req.body());
@@ -92,7 +96,11 @@ public class SnapshotController {
         boolean bufferIsEmpty = feedSource.editorNamespace == null;
         // Create new non-buffer snapshot.
         CreateSnapshotJob createSnapshotJob =
-                new CreateSnapshotJob(snapshot, bufferIsEmpty, !bufferIsEmpty, false);
+                new CreateSnapshotJob(userProfile, snapshot, bufferIsEmpty, !bufferIsEmpty, false);
+        // Add publish feed version job if specified by request.
+        if (publishNewVersion) {
+            createSnapshotJob.addNextJob(new CreateFeedVersionFromSnapshotJob(feedSource, snapshot, userProfile));
+        }
         // Begin asynchronous execution.
         DataManager.heavyExecutor.execute(createSnapshotJob);
         return SparkUtils.formatJobMessage(createSnapshotJob.jobId, "Creating snapshot.");
@@ -114,7 +122,7 @@ public class SnapshotController {
         // explicitly asked for it. Otherwise, let go of the buffer.
         boolean preserveBuffer = "true".equals(req.queryParams("preserveBuffer")) && feedSource.editorNamespace != null;
         CreateSnapshotJob createSnapshotJob =
-                new CreateSnapshotJob(snapshot, true, false, preserveBuffer);
+                new CreateSnapshotJob(userProfile, snapshot, true, false, preserveBuffer);
         DataManager.heavyExecutor.execute(createSnapshotJob);
         return formatJobMessage(createSnapshotJob.jobId, "Importing version as snapshot.");
     }
@@ -153,8 +161,7 @@ public class SnapshotController {
         // copy of a feed for no reason.
         String name = "Restore snapshot " + snapshotToRestore.name;
         Snapshot snapshot = new Snapshot(name, feedSource.id, snapshotToRestore.namespace);
-        snapshot.storeUser(userProfile);
-        CreateSnapshotJob createSnapshotJob = new CreateSnapshotJob(snapshot, true, false, preserveBuffer);
+        CreateSnapshotJob createSnapshotJob = new CreateSnapshotJob(userProfile, snapshot, true, false, preserveBuffer);
         DataManager.heavyExecutor.execute(createSnapshotJob);
         return formatJobMessage(createSnapshotJob.jobId, "Restoring snapshot...");
     }
@@ -165,11 +172,10 @@ public class SnapshotController {
      */
     private static String downloadSnapshotAsGTFS(Request req, Response res) {
         Auth0UserProfile userProfile = req.attribute("user");
-        String userId = userProfile.getUser_id();
         Snapshot snapshot = getSnapshotFromRequest(req);
         // Create and kick off export job.
         // FIXME: what if a snapshot is already written to S3?
-        ExportSnapshotToGTFSJob exportSnapshotToGTFSJob = new ExportSnapshotToGTFSJob(userId,  snapshot);
+        ExportSnapshotToGTFSJob exportSnapshotToGTFSJob = new ExportSnapshotToGTFSJob(userProfile,  snapshot);
         DataManager.heavyExecutor.execute(exportSnapshotToGTFSJob);
         return formatJobMessage(exportSnapshotToGTFSJob.jobId, "Exporting snapshot to GTFS.");
     }
@@ -219,7 +225,7 @@ public class SnapshotController {
         if (snapshot == null) logMessageAndHalt(req, 400, "Must provide valid snapshot ID.");
         try {
             // Remove the snapshot and then renumber the snapshots
-            Persistence.snapshots.removeById(snapshot.id);
+            snapshot.delete();
             feedSource.renumberSnapshots();
             // FIXME Are there references that need to be removed? E.g., what if the active buffer snapshot is deleted?
             // FIXME delete tables from database?

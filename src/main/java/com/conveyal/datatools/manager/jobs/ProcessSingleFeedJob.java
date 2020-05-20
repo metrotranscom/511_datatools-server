@@ -1,6 +1,7 @@
 package com.conveyal.datatools.manager.jobs;
 
 import com.conveyal.datatools.common.status.MonitorableJob;
+import com.conveyal.datatools.manager.auth.Auth0UserProfile;
 import com.conveyal.datatools.manager.models.FeedVersion;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import org.slf4j.Logger;
@@ -15,19 +16,17 @@ import org.slf4j.LoggerFactory;
  */
 public class ProcessSingleFeedJob extends MonitorableJob {
     private FeedVersion feedVersion;
-    private String owner;
     private final boolean isNewVersion;
     private static final Logger LOG = LoggerFactory.getLogger(ProcessSingleFeedJob.class);
 
     /**
      * Create a job for the given feed version.
      */
-    public ProcessSingleFeedJob (FeedVersion feedVersion, String owner, boolean isNewVersion) {
+    public ProcessSingleFeedJob (FeedVersion feedVersion, Auth0UserProfile owner, boolean isNewVersion) {
         super(owner, "Processing GTFS for " + (feedVersion.parentFeedSource() != null ? feedVersion.parentFeedSource().name : "unknown feed source"), JobType.PROCESS_FEED);
         this.feedVersion = feedVersion;
-        this.owner = owner;
         this.isNewVersion = isNewVersion;
-        status.update(false,  "Processing...", 0);
+        status.update("Waiting...", 0);
         status.uploading = true;
     }
 
@@ -63,7 +62,7 @@ public class ProcessSingleFeedJob extends MonitorableJob {
     public void jobFinished () {
         if (!status.error) {
             // Note: storing a new feed version in database is handled at completion of the ValidateFeedJob subtask.
-            status.update(false, "New version saved.", 100, true);
+            status.completeSuccessfully("New version saved.");
         } else {
             // Processing did not complete. Depending on which sub-task this occurred in,
             // there may or may not have been a successful load/validation of the feed.

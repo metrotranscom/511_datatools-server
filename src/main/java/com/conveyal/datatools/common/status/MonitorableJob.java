@@ -1,26 +1,30 @@
 package com.conveyal.datatools.common.status;
 
 import com.conveyal.datatools.manager.DataManager;
-import com.google.common.collect.Sets;
+import com.conveyal.datatools.manager.auth.Auth0UserProfile;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.io.Serializable;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
+
+import static com.conveyal.datatools.manager.controllers.api.StatusController.getJobsForUser;
 
 /**
  * Created by landon on 6/13/16.
  */
-public abstract class MonitorableJob implements Runnable {
+public abstract class MonitorableJob implements Runnable, Serializable {
+    private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(MonitorableJob.class);
-    public final String owner;
+    protected final Auth0UserProfile owner;
 
     // Public fields will be serialized over HTTP API and visible to the web client
     public final JobType type;
@@ -60,23 +64,29 @@ public abstract class MonitorableJob implements Runnable {
         EXPORT_SNAPSHOT_TO_GTFS,
         CONVERT_EDITOR_MAPDB_TO_SQL,
         VALIDATE_ALL_FEEDS,
+        MONITOR_SERVER_STATUS,
         MERGE_FEED_VERSIONS
     }
 
-    public MonitorableJob(String owner, String name, JobType type) {
+    public MonitorableJob(Auth0UserProfile owner, String name, JobType type) {
+        // Prevent the creation of a job if the user is null.
+        if (owner == null) {
+            throw new IllegalArgumentException("MonitorableJob must be registered with a non-null user/owner.");
+        }
         this.owner = owner;
         this.name = name;
+        status.name = name;
         this.type = type;
         registerJob();
     }
 
-    public MonitorableJob(String owner) {
+    public MonitorableJob(Auth0UserProfile owner) {
         this(owner, "Unnamed Job", JobType.UNKNOWN_TYPE);
     }
 
     /** Constructor for a usually unmonitored system job (but still something we want to conform to our model). */
     public MonitorableJob () {
-        this("system", "System job", JobType.SYSTEM_JOB);
+        this(Auth0UserProfile.createSystemUser(), "System job", JobType.SYSTEM_JOB);
     }
 
     /**
@@ -84,27 +94,25 @@ public abstract class MonitorableJob implements Runnable {
      * It is a standard start-up stage for all monitorable jobs.
      */
     private void registerJob() {
-        Set<MonitorableJob> userJobs = DataManager.userJobsMap.get(this.owner);
-        // If there are no current jobs for the user, create a new empty set. NOTE: this should be a concurrent hash
-        // set so that it is threadsafe.
-        if (userJobs == null) userJobs = Sets.newConcurrentHashSet();
+        // Get all active jobs and add the latest active job. Note: Removal of job from user's set of jobs is handled
+        // in the StatusController when a user requests their active jobs and the job has finished/errored.
+        Set<MonitorableJob> userJobs = getJobsForUser(this.owner);
         userJobs.add(this);
+        DataManager.userJobsMap.put(retrieveUserId(), userJobs);
+    }
 
-        DataManager.userJobsMap.put(this.owner, userJobs);
+    @JsonProperty("owner")
+    public String retrieveUserId() {
+        return this.owner.getUser_id();
+    }
+
+    @JsonProperty("email")
+    public String retrieveEmail() {
+        return this.owner.getEmail();
     }
 
     public File retrieveFile () {
         return file;
-    }
-
-    /**
-     * This method should never be called directly or overridden. It is a standard clean up stage for all
-     * monitorable jobs.
-     */
-    private void unRegisterJob () {
-        // remove this job from the user-job map
-        Set<MonitorableJob> userJobs = DataManager.userJobsMap.get(this.owner);
-        if (userJobs != null) userJobs.remove(this);
     }
 
     /**
@@ -117,7 +125,8 @@ public abstract class MonitorableJob implements Runnable {
      * all sub-jobs have completed.
      */
     public void jobFinished () {
-        // do nothing by default.
+        // Do nothing by default. Note: job is only removed from active jobs set only when a user requests the latest jobs
+        // via the StatusController HTTP endpoint.
     }
 
     /**
@@ -128,7 +137,6 @@ public abstract class MonitorableJob implements Runnable {
         boolean parentJobErrored = false;
         boolean subTaskErrored = false;
         String cancelMessage = "";
-        long startTimeNanos = System.nanoTime();
         try {
             // First execute the core logic of the specific MonitorableJob subclass
             jobLogic();
@@ -142,21 +150,19 @@ public abstract class MonitorableJob implements Runnable {
             int subJobsTotal = subJobs.size() + 1;
 
             for (MonitorableJob subJob : subJobs) {
+                String subJobName = subJob.getClass().getSimpleName();
                 if (!parentJobErrored && !subTaskErrored) {
+                    // Calculate completion based on number of sub jobs remaining.
+                    double percentComplete = subJobNumber * 100D / subJobsTotal;
                     // Run sub-task if no error has errored during parent job or previous sub-task execution.
-                    // FIXME this will overwrite a message if message is set somewhere else.
-                    // FIXME If a subtask fails, cancel the parent task and cancel or remove subsequent sub-tasks.
-//                status.message = String.format("Finished %d/%d sub-tasks", subJobNumber, subJobsTotal);
-                    status.percentComplete = subJobNumber * 100D / subJobsTotal;
-                    status.error = false; // FIXME: remove this error=false assignment
+                    status.update(String.format("Waiting on %s...", subJobName), percentComplete);
                     subJob.run();
-
                     // Record if there has been an error in the execution of the sub-task. (Note: this will not
                     // incorrectly overwrite a 'true' value with 'false' because the sub-task is only run if
                     // jobHasErrored is false.
                     if (subJob.status.error) {
                         subTaskErrored = true;
-                        cancelMessage = String.format("Task cancelled due to error in %s task", subJob.getClass().getSimpleName());
+                        cancelMessage = String.format("Task cancelled due to error in %s task", subJobName);
                     }
                 } else {
                     // Cancel (fail) next sub-task and continue.
@@ -170,26 +176,21 @@ public abstract class MonitorableJob implements Runnable {
                 // because the error presumably already occurred and has a better error message.
                 cancel(cancelMessage);
             }
-
+            // Complete the job (as success if no errors encountered, as failure otherwise).
+            if (!parentJobErrored && !subTaskErrored) status.completeSuccessfully("Job complete!");
+            else status.complete(true);
             // Run final steps of job pending completion or error. Note: any tasks that depend on job success should
-            // check job status to determine if final step should be executed (e.g., storing feed version in MongoDB).
+            // check job status in jobFinished to determine if final step should be executed (e.g., storing feed
+            // version in MongoDB).
             // TODO: should we add separate hooks depending on state of job/sub-tasks (e.g., success, catch, finally)
             jobFinished();
 
-            status.completed = true;
-
             // We retain finished or errored jobs on the server until they are fetched via the API, which implies they
             // could be displayed by the client.
-        } catch (Exception ex) {
-            // Set job status to failed
-            // Note that when an exception occurs during job execution we do not call unRegisterJob,
-            // so the job continues to exist in the failed state and the user can see it.
-            LOG.error("Job failed", ex);
-            status.update(true, ex.getMessage(), 100, true);
+        } catch (Exception e) {
+            status.fail("Job failed due to unhandled exception!", e);
         }
-        status.startTime = TimeUnit.NANOSECONDS.toMillis(startTimeNanos);
-        status.duration = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTimeNanos);
-        LOG.info("{} {} {} in {} ms", type, jobId, status.error ? "errored" : "completed", status.duration);
+        LOG.info("{} (jobId={}) {} in {} ms", type, jobId, status.error ? "errored" : "completed", status.duration);
     }
 
     /**
@@ -200,8 +201,7 @@ public abstract class MonitorableJob implements Runnable {
     private void cancel(String message) {
         // Updating the job status with error is all we need to do in order to move the job into completion. Once the
         // user fetches the errored job, it will be automatically removed from the system.
-        status.update(true, message, 100);
-        status.completed = true;
+        status.fail(message);
         // FIXME: Do we need to run any clean up here?
     }
 
@@ -242,7 +242,7 @@ public abstract class MonitorableJob implements Runnable {
         /** How much of task is complete? */
         public double percentComplete;
 
-        public long startTime;
+        public long startTime = System.currentTimeMillis();
         public long duration;
 
         // When was the job initialized?
@@ -254,39 +254,76 @@ public abstract class MonitorableJob implements Runnable {
         // Name of file/item once completed
         public String completedName;
 
+        /**
+         * Update status message and percent complete. This method should be used while job is still in progress.
+         */
         public void update (String message, double percentComplete) {
+            LOG.info("Job updated `{}`: `{}`\n{}", name, message, getCallingMethodTrace());
             this.message = message;
             this.percentComplete = percentComplete;
         }
 
-        public void update (boolean isError, String message, double percentComplete) {
+        /**
+         * Gets stack trace from method calling {@link #update(String, double)} or {@link #fail(String)} for logging
+         * purposes.
+         */
+        private String getCallingMethodTrace() {
+            StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
+            // Get trace from method calling update or fail. To trace this back:
+            // 0. this thread
+            // 1. this method
+            // 2. Status#update or Status#fail
+            // 3. line where update/fail is called in server job
+            return stackTrace.length >= 3 ? stackTrace[3].toString() : "WARNING: Stack trace not found.";
+        }
+
+        /**
+         * Shorthand method to update status object on successful job completion.
+         */
+        public void completeSuccessfully(String message) {
+            this.complete(false, message);
+        }
+
+        /**
+         * Set job status to completed with error and message information.
+         */
+        private void complete(boolean isError, String message) {
             this.error = isError;
-            this.message = message;
-            this.percentComplete = percentComplete;
+            // Skip message update if null.
+            if (message != null) this.message = message;
+            this.percentComplete = 100;
+            this.completed = true;
+            this.duration = System.currentTimeMillis() - this.startTime;
         }
 
-        public void update (boolean isError, String message, double percentComplete, boolean isComplete) {
-            this.error = isError;
-            this.message = message;
-            this.percentComplete = percentComplete;
-            this.completed = isComplete;
+        /**
+         * Shorthand method to complete job without overriding current message.
+         */
+        private void complete(boolean isError) {
+            complete(isError, null);
         }
 
+        /**
+         * Fail job status with message and exception.
+         */
         public void fail (String message, Exception e) {
-            this.error = true;
-            this.percentComplete = 100;
-            this.completed = true;
-            this.message = message;
-            this.exceptionDetails = ExceptionUtils.getStackTrace(e);
-            this.exceptionType = e.getMessage();
+            if (e != null) {
+                this.exceptionDetails = ExceptionUtils.getStackTrace(e);
+                this.exceptionType = e.getMessage();
+                // If exception is null, overloaded fail method was called and message already logged with trace.
+                String logMessage = String.format("Job `%s` failed with message: `%s`", name, message);
+                LOG.warn(logMessage, e);
+            }
+            this.complete(true, message);
         }
 
+        /**
+         * Fail job status with message.
+         */
         public void fail (String message) {
-            this.error = true;
-            this.percentComplete = 100;
-            this.completed = true;
-            this.message = message;
+            // Log error with stack trace from calling method in job.
+            LOG.error("Job failed with message {}\n{}", message, getCallingMethodTrace());
+            fail(message, null);
         }
-
     }
 }

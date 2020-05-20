@@ -1,6 +1,10 @@
 package com.conveyal.datatools.manager.models;
 
+import com.amazonaws.services.ec2.model.Filter;
+import com.conveyal.datatools.common.utils.AWSUtils;
 import com.conveyal.datatools.manager.DataManager;
+import com.conveyal.datatools.manager.controllers.api.DeploymentController;
+import com.conveyal.datatools.manager.jobs.DeployJob;
 import com.conveyal.datatools.manager.persistence.Persistence;
 import com.conveyal.datatools.manager.utils.StringUtils;
 import com.conveyal.datatools.manager.utils.json.JsonManager;
@@ -10,6 +14,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonInclude.Include;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonView;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.io.ByteStreams;
 
@@ -29,6 +34,7 @@ import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -55,13 +61,20 @@ public class Deployment extends Model implements Serializable {
 
     public String name;
 
+    public static final String DEFAULT_OTP_VERSION = "otp-v1.4.0";
+    public static final String DEFAULT_R5_VERSION = "v2.4.1-9-g3be6daa";
+
     /** What server is this currently deployed to? */
     public String deployedTo;
 
-    @JsonView(JsonViews.DataDump.class)
+    public List<DeployJob.DeploySummary> deployJobSummaries = new ArrayList<>();
+
     public String projectId;
 
-    @JsonProperty("project")
+    /**
+     * Get parent project for deployment. Note: at one point this was a JSON property of this class, but severe
+     * performance issues prevent this field from scaling to be fetched/assigned to a large collection of deployments.
+     */
     public Project parentProject() {
         return Persistence.projects.getById(projectId);
     }
@@ -105,22 +118,65 @@ public class Deployment extends Model implements Serializable {
         return ret;
     }
 
-    public void storeFeedVersions(Collection<FeedVersion> versions) {
-        feedVersionIds = new ArrayList<>(versions.size());
-
-        for (FeedVersion version : versions) {
-            feedVersionIds.add(version.id);
+    /** Fetch ec2 instances tagged with this deployment's ID. */
+    public List<EC2InstanceSummary> retrieveEC2Instances() {
+        if (!"true".equals(DataManager.getConfigPropertyAsText("modules.deployment.ec2.enabled"))) return Collections.EMPTY_LIST;
+        Filter deploymentFilter = new Filter("tag:deploymentId", Collections.singletonList(id));
+        // Check if the latest deployment used alternative credentials/AWS role.
+        String role = null;
+        String region = null;
+        if (this.latest() != null) {
+            OtpServer server = Persistence.servers.getById(this.latest().serverId);
+            if (server != null) {
+                role = server.role;
+                if (server.ec2Info != null) {
+                    region = server.ec2Info.region;
+                }
+            }
         }
+        return DeploymentController.fetchEC2InstanceSummaries(
+            AWSUtils.getEC2ClientForRole(role, region),
+            deploymentFilter
+        );
     }
 
-    // future use
-    public String osmFileId;
+    /**
+     * Public URL at which the OSM extract should be downloaded. This should be null if the extract should be downloaded
+     * from an extract server. Extract type should be a .pbf.
+     */
+    public String osmExtractUrl;
 
-    /** The commit of OTP being used on this deployment */
-    public String otpCommit;
+    /** If true, OSM extract will be skipped entirely (extract will be fetched from neither extract server nor URL. */
+    public boolean skipOsmExtract;
+
+    /**
+     * The version (according to git describe) of OTP being used on this deployment This should default to
+     * {@link Deployment#DEFAULT_OTP_VERSION}.
+     */
+    public String otpVersion;
+
+    public boolean buildGraphOnly;
+
+    /**
+     * The version (according to git describe) of R5 being used on this deployment. This should default to
+     * {@link Deployment#DEFAULT_R5_VERSION}.
+     */
+    public String r5Version;
+
+    /** Whether this deployment should build an r5 server (false=OTP) */
+    public boolean r5;
 
     /** Date when the deployment was last deployed to a server */
-    public Date lastDeployed;
+    @JsonProperty("lastDeployed")
+    public Date retrieveLastDeployed () {
+        return latest() != null ? new Date(latest().finishTime) : null;
+    }
+
+    /** Get latest deployment summary. */
+    @JsonProperty("latest")
+    public DeployJob.DeploySummary latest () {
+        return deployJobSummaries.size() > 0 ? deployJobSummaries.get(0) : null;
+    }
 
     /**
      * The routerId of this deployment
@@ -226,7 +282,8 @@ public class Deployment extends Model implements Serializable {
         // do nothing.
     }
 
-    /** Dump this deployment to the given file
+    /**
+     * Dump this deployment to the given output file.
      * @param output the output file
      * @param includeOsm should an osm.pbf file be included in the dump?
      * @param includeOtpConfig should OTP build-config.json and router-config.json be included?
@@ -292,40 +349,60 @@ public class Deployment extends Model implements Serializable {
         }
 
         if (includeOtpConfig) {
-            // Write build-config.json and router-config.json
-            Project project = this.parentProject();
-            ObjectMapper mapper = new ObjectMapper();
+            // Write build-config.json and router-config.json into zip file.
             // Use custom build config if it is not null, otherwise default to project build config.
-            byte[] buildConfigAsBytes = customBuildConfig != null
-                ? customBuildConfig.getBytes(StandardCharsets.UTF_8)
-                : project.buildConfig != null
-                    ? mapper.writer().writeValueAsBytes(project.buildConfig)
-                    : null;
+            byte[] buildConfigAsBytes = generateBuildConfig();
             if (buildConfigAsBytes != null) {
                 // Include build config if not null.
                 ZipEntry buildConfigEntry = new ZipEntry("build-config.json");
                 out.putNextEntry(buildConfigEntry);
-                mapper.setSerializationInclusion(Include.NON_NULL);
                 out.write(buildConfigAsBytes);
                 out.closeEntry();
             }
             // Use custom router config if it is not null, otherwise default to project router config.
-            byte[] routerConfigAsBytes = customRouterConfig != null
-                ? customRouterConfig.getBytes(StandardCharsets.UTF_8)
-                : project.routerConfig != null
-                    ? mapper.writer().writeValueAsBytes(project.routerConfig)
-                    : null;
+            byte[] routerConfigAsBytes = generateRouterConfig();
             if (routerConfigAsBytes != null) {
                 // Include router config if not null.
                 ZipEntry routerConfigEntry = new ZipEntry("router-config.json");
                 out.putNextEntry(routerConfigEntry);
-                mapper.setSerializationInclusion(Include.NON_NULL);
                 out.write(routerConfigAsBytes);
                 out.closeEntry();
             }
         }
         // Finally close the zip output stream. The dump file is now complete.
         out.close();
+    }
+
+    /** Generate build config for deployment as byte array (for writing to file output stream). */
+    public byte[] generateBuildConfig() {
+        Project project = this.parentProject();
+        return customBuildConfig != null
+            ? customBuildConfig.getBytes(StandardCharsets.UTF_8)
+            : project.buildConfig != null
+                ? writeToBytes(project.buildConfig)
+                : null;
+    }
+
+    /** Convenience method to write serializable object (primarily for router/build config objects) to byte array. */
+    private <O extends Serializable> byte[] writeToBytes(O object) {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.setSerializationInclusion(Include.NON_NULL);
+        try {
+            return mapper.writer().writeValueAsBytes(object);
+        } catch (JsonProcessingException e) {
+            LOG.error("Value contains malformed JSON", e);
+            return null;
+        }
+    }
+
+    /** Generate router config for deployment as byte array (for writing to file output stream). */
+    public byte[] generateRouterConfig() {
+        Project project = this.parentProject();
+        return customRouterConfig != null
+            ? customRouterConfig.getBytes(StandardCharsets.UTF_8)
+            : project.routerConfig != null
+                ? writeToBytes(project.routerConfig)
+                : null;
     }
 
     /**
@@ -418,9 +495,9 @@ public class Deployment extends Model implements Serializable {
     /**
      * Get the deployments currently deployed to a particular server and router combination.
      */
-    public static FindIterable<Deployment> retrieveDeploymentForServerAndRouterId(String server, String routerId) {
+    public static FindIterable<Deployment> retrieveDeploymentForServerAndRouterId(String serverId, String routerId) {
         return Persistence.deployments.getMongoCollection().find(and(
-                eq("deployedTo", server),
+                eq("deployedTo", serverId),
                 eq("routerId", routerId)
         ));
     }
@@ -474,10 +551,23 @@ public class Deployment extends Model implements Serializable {
      */
     public abstract static class DeploymentFullFeedVersionMixin {
         @JsonIgnore
-        public abstract Collection<SummarizedFeedVersion> retrievefeedVersions();
+        public abstract Collection<SummarizedFeedVersion> retrieveFeedVersions();
 
-//        @JsonProperty("feedVersions")
+        @JsonProperty("feedVersions")
         @JsonIgnore(false)
         public abstract Collection<FeedVersion> retrieveFullFeedVersions ();
+    }
+
+    /**
+     * A MixIn to be applied to this deployment, for returning a single deployment, so that the list of ec2Instances is
+     * included in the JSON response.
+     *
+     * Usually a mixin would be used on an external class, but since we are changing one thing about a single class, it seemed
+     * unnecessary to define a new view.
+     */
+    public abstract static class DeploymentWithEc2InstancesMixin {
+
+        @JsonProperty("ec2Instances")
+        public abstract Collection<FeedVersion> retrieveEC2Instances ();
     }
 }

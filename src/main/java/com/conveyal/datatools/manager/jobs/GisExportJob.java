@@ -3,6 +3,7 @@ package com.conveyal.datatools.manager.jobs;
 import com.conveyal.datatools.common.status.MonitorableJob;
 import com.conveyal.datatools.editor.utils.DirectoryZip;
 import com.conveyal.datatools.manager.DataManager;
+import com.conveyal.datatools.manager.auth.Auth0UserProfile;
 import com.conveyal.datatools.manager.models.FeedVersion;
 import com.conveyal.datatools.manager.persistence.Persistence;
 import com.conveyal.gtfs.loader.Feed;
@@ -26,7 +27,6 @@ import org.geotools.data.simple.SimpleFeatureSource;
 import org.geotools.data.simple.SimpleFeatureStore;
 import org.geotools.feature.DefaultFeatureCollection;
 import org.geotools.feature.simple.SimpleFeatureBuilder;
-import org.geotools.feature.simple.SimpleFeatureTypeBuilder;
 import org.geotools.referencing.crs.DefaultGeographicCRS;
 import org.opengis.feature.simple.SimpleFeature;
 import org.opengis.feature.simple.SimpleFeatureType;
@@ -50,7 +50,7 @@ public class GisExportJob extends MonitorableJob {
     public ExportType exportType;
     public Collection<String> feedIds;
 
-    public GisExportJob(ExportType exportType, File file, Collection<String> feedIds, String owner) {
+    public GisExportJob(ExportType exportType, File file, Collection<String> feedIds, Auth0UserProfile owner) {
         super(
             owner,
             String.format("Export %s GIS for feed", exportType.toString().toLowerCase()),
@@ -285,13 +285,9 @@ public class GisExportJob extends MonitorableJob {
                 f.delete();
             }
             outDir.delete();
-            status.update(false, "Export complete!", 100);
-            status.completed = true;
+            status.completeSuccessfully("Export complete!");
         } catch (Exception e) {
-            String message = "An exception occurred during the GIS export";
-            LOG.error(message);
-            status.fail(message);
-            e.printStackTrace();
+            status.fail("An exception occurred during the GIS export", e);
         } finally {
             if (connection != null) DbUtils.closeQuietly(connection);
         }

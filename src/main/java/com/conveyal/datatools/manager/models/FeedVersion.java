@@ -29,6 +29,7 @@ import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.time.LocalDate;
 import java.util.Date;
+import java.util.UUID;
 
 import static com.conveyal.datatools.manager.utils.StringUtils.getCleanName;
 import static com.mongodb.client.model.Filters.and;
@@ -68,7 +69,8 @@ public class FeedVersion extends Model implements Serializable {
 
         // since we store directly on the file system, this lets users look at the DB directly
         // TODO: no need to BaseGTFSCache.cleanId once we rely on GTFSCache to store the feed.
-        return BaseGTFSCache.cleanId(getCleanName(source.name) + "-" + df.format(this.updated) + "-" + source.id) + ".zip";
+        String uuid = UUID.randomUUID().toString();
+        return BaseGTFSCache.cleanId(String.join("-", getCleanName(source.name), df.format(this.updated), source.id, uuid)) + ".zip";
     }
 
     /**
@@ -191,6 +193,12 @@ public class FeedVersion extends Model implements Serializable {
     public String namespace;
 
     /**
+     * Indicates the namespace from which this version originated. For example, if it was published from a snapshot
+     * namespace or a GTFS+ feed, this field will reference that source namespace.
+     */
+    public String originNamespace;
+
+    /**
      * Indicates when a feed version was published to an external source. If null, the version has not been sent. This
      * field is currently in use only for the MTC extension and is reset to null after the published version has been
      * registered externally.
@@ -213,7 +221,7 @@ public class FeedVersion extends Model implements Serializable {
         File gtfsFile;
         // STEP 1. LOAD GTFS feed into relational database
         try {
-            status.update(false,"Unpacking feed...", 15.0);
+            status.update("Unpacking feed...", 15.0);
             // Get SQL schema namespace for the feed version. This is needed for reconnecting with feeds
             // in the database.
             gtfsFile = retrieveGtfsFile();
@@ -228,9 +236,7 @@ public class FeedVersion extends Model implements Serializable {
             this.namespace = feedLoadResult.uniqueIdentifier;
             LOG.info("Loaded GTFS into SQL {}", feedLoadResult.uniqueIdentifier);
         } catch (Exception e) {
-            String errorString = String.format("Error loading GTFS feed for version: %s", this.id);
-            LOG.warn(errorString, e);
-            status.update(true, errorString, 0);
+            status.fail(String.format("Error loading GTFS feed for version: %s", this.id), e);
             // FIXME: Delete local copy of feed version after failed load?
             return;
         }
@@ -238,9 +244,7 @@ public class FeedVersion extends Model implements Serializable {
         // FIXME: is this the right approach?
         // if load was unsuccessful, update status and return
         if(this.feedLoadResult == null) {
-            String errorString = String.format("Could not load GTFS for FeedVersion %s", id);
-            LOG.error(errorString);
-            status.update(true, errorString, 0);
+            status.fail(String.format("Could not load GTFS for FeedVersion %s", id));
             // FIXME: Delete local copy of feed version after failed load?
             return;
         }
@@ -302,9 +306,7 @@ public class FeedVersion extends Model implements Serializable {
             status.update("Validating feed...", 33);
             validationResult = GTFS.validate(feedLoadResult.uniqueIdentifier, DataManager.GTFS_DATA_SOURCE);
         } catch (Exception e) {
-            String message = String.format("Unable to validate feed %s", this.id);
-            LOG.error(message, e);
-            status.update(true, message, 100, true);
+            status.fail(String.format("Unable to validate feed %s", this.id), e);
             // FIXME create validation result with new constructor?
             validationResult = new ValidationResult();
             validationResult.fatalException = "failure!";
@@ -391,6 +393,8 @@ public class FeedVersion extends Model implements Serializable {
                 Persistence.feedSources.update(fs.id, "{lastFetched:null}");
             }
             feedStore.deleteFeed(id);
+            // Delete feed version tables in GTFS database
+            GTFS.delete(this.namespace, DataManager.GTFS_DATA_SOURCE);
             // Remove this FeedVersion from all Deployments associated with this FeedVersion's FeedSource's Project
             // TODO TEST THOROUGHLY THAT THIS UPDATE EXPRESSION IS CORRECT
             // Although outright deleting the feedVersion from deployments could be surprising and shouldn't be done anyway.
